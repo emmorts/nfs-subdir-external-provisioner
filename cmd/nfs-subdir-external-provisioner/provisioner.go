@@ -31,13 +31,15 @@ import (
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"golang.org/x/time/rate"
 	v1 "k8s.io/api/core/v1"
-
 	storage "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/client-go/util/workqueue"
 	storagehelpers "k8s.io/component-helpers/storage/volume"
 	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
 )
@@ -352,6 +354,12 @@ func main() {
 		glog.Fatal(http.ListenAndServe(":8080", nil))
 	}()
 
+	// Create a custom rate limiter
+	rateLimiter := workqueue.NewMaxOfRateLimiter(
+		workqueue.NewItemExponentialFailureRateLimiter(5*time.Millisecond, 1000*time.Second),
+		&workqueue.BucketRateLimiter{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+
 	// Start the provision controller which will dynamically provision efs NFS
 	// PVs
 	pc := controller.NewProvisionController(clientset,
@@ -362,7 +370,7 @@ func main() {
 		controller.Threadiness(5),
 		controller.FailedProvisionThreshold(10),
 		controller.FailedDeleteThreshold(10),
-		controller.RateLimiter(controller.DefaultControllerRateLimiter()),
+		controller.RateLimiter(rateLimiter),
 	)
 	// Never stops.
 	pc.Run(context.Background())
