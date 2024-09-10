@@ -18,16 +18,19 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/golang/glog"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	v1 "k8s.io/api/core/v1"
 
 	storage "k8s.io/api/storage/v1"
@@ -41,7 +44,30 @@ import (
 
 const (
 	provisionerNameKey = "PROVISIONER_NAME"
+	mountPath          = "/persistentvolumes"
 )
+
+var (
+	provisionAttempts = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nfs_provision_attempts_total",
+			Help: "The total number of provision attempts by the NFS provisioner.",
+		},
+		[]string{"result"},
+	)
+	deleteAttempts = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "nfs_delete_attempts_total",
+			Help: "The total number of delete attempts by the NFS provisioner.",
+		},
+		[]string{"result"},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(provisionAttempts)
+	prometheus.MustRegister(deleteAttempts)
+}
 
 type nfsProvisioner struct {
 	client kubernetes.Interface
@@ -72,10 +98,6 @@ func (meta *pvcMetadata) stringParser(str string) string {
 
 	return str
 }
-
-const (
-	mountPath = "/persistentvolumes"
-)
 
 var _ controller.Provisioner = &nfsProvisioner{}
 
@@ -112,12 +134,20 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 	}
 
 	glog.V(4).Infof("creating path %s", fullPath)
-	if err := os.MkdirAll(fullPath, 0o777); err != nil {
-		return nil, controller.ProvisioningFinished, errors.New("unable to create directory to provision new pv: " + err.Error())
-	}
-	err := os.Chmod(fullPath, 0o777)
+	err := retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return err != nil
+	}, func() error {
+		return os.MkdirAll(fullPath, 0o777)
+	})
 	if err != nil {
-		return nil, "", err
+		provisionAttempts.WithLabelValues("failure").Inc()
+		return nil, controller.ProvisioningFinished, fmt.Errorf("unable to create directory to provision new pv: %v", err)
+	}
+
+	err = os.Chmod(fullPath, 0o777)
+	if err != nil {
+		provisionAttempts.WithLabelValues("failure").Inc()
+		return nil, controller.ProvisioningFinished, fmt.Errorf("unable to set permissions on new directory: %v", err)
 	}
 
 	pv := &v1.PersistentVolume{
@@ -140,6 +170,13 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 			},
 		},
 	}
+
+	// Add custom mount options if specified in StorageClass
+	if mountOptions, ok := options.StorageClass.Parameters["mountOptions"]; ok {
+		pv.Spec.MountOptions = append(pv.Spec.MountOptions, strings.Split(mountOptions, ",")...)
+	}
+
+	provisionAttempts.WithLabelValues("success").Inc()
 	return pv, controller.ProvisioningFinished, nil
 }
 
@@ -152,40 +189,67 @@ func (p *nfsProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume
 		glog.Warningf("path %s does not exist, deletion skipped", oldPath)
 		return nil
 	}
-	// Get the storage class for this volume.
+
 	storageClass, err := p.getClassForVolume(ctx, volume)
 	if err != nil {
-		return err
+		deleteAttempts.WithLabelValues("failure").Inc()
+		return fmt.Errorf("unable to get storage class: %v", err)
 	}
 
-	// Determine if the "onDelete" parameter exists.
-	// If it exists and has a `delete` value, delete the directory.
-	// If it exists and has a `retain` value, safe the directory.
 	onDelete := storageClass.Parameters["onDelete"]
 	switch onDelete {
 	case "delete":
-		return os.RemoveAll(oldPath)
+		err := retry.OnError(retry.DefaultRetry, func(err error) bool {
+			return err != nil
+		}, func() error {
+			return os.RemoveAll(oldPath)
+		})
+		if err != nil {
+			deleteAttempts.WithLabelValues("failure").Inc()
+			return fmt.Errorf("unable to delete directory: %v", err)
+		}
+		deleteAttempts.WithLabelValues("success").Inc()
+		return nil
 	case "retain":
+		deleteAttempts.WithLabelValues("success").Inc()
 		return nil
 	}
 
-	// Determine if the "archiveOnDelete" parameter exists.
-	// If it exists and has a false value, delete the directory.
-	// Otherwise, archive it.
 	archiveOnDelete, exists := storageClass.Parameters["archiveOnDelete"]
 	if exists {
 		archiveBool, err := strconv.ParseBool(archiveOnDelete)
 		if err != nil {
-			return err
+			deleteAttempts.WithLabelValues("failure").Inc()
+			return fmt.Errorf("invalid archiveOnDelete value: %v", err)
 		}
 		if !archiveBool {
-			return os.RemoveAll(oldPath)
+			err := retry.OnError(retry.DefaultRetry, func(err error) bool {
+				return err != nil
+			}, func() error {
+				return os.RemoveAll(oldPath)
+			})
+			if err != nil {
+				deleteAttempts.WithLabelValues("failure").Inc()
+				return fmt.Errorf("unable to delete directory: %v", err)
+			}
+			deleteAttempts.WithLabelValues("success").Inc()
+			return nil
 		}
 	}
 
 	archivePath := filepath.Join(mountPath, "archived-"+basePath)
 	glog.V(4).Infof("archiving path %s to %s", oldPath, archivePath)
-	return os.Rename(oldPath, archivePath)
+	err = retry.OnError(retry.DefaultRetry, func(err error) bool {
+		return err != nil
+	}, func() error {
+		return os.Rename(oldPath, archivePath)
+	})
+	if err != nil {
+		deleteAttempts.WithLabelValues("failure").Inc()
+		return fmt.Errorf("unable to archive directory: %v", err)
+	}
+	deleteAttempts.WithLabelValues("success").Inc()
+	return nil
 }
 
 // getClassForVolume returns StorageClass.
@@ -203,6 +267,11 @@ func (p *nfsProvisioner) getClassForVolume(ctx context.Context, pv *v1.Persisten
 	}
 
 	return class, nil
+}
+
+func (p *nfsProvisioner) checkNFSServerHealth() error {
+	_, err := os.Stat(mountPath)
+	return err
 }
 
 func main() {
@@ -266,6 +335,23 @@ func main() {
 		server: server,
 		path:   path,
 	}
+
+	// Start health check goroutine
+	go func() {
+		for {
+			if err := clientNFSProvisioner.checkNFSServerHealth(); err != nil {
+				glog.Errorf("NFS server health check failed: %v", err)
+			}
+			time.Sleep(5 * time.Minute)
+		}
+	}()
+
+	// Start metrics server
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		glog.Fatal(http.ListenAndServe(":8080", nil))
+	}()
+
 	// Start the provision controller which will dynamically provision efs NFS
 	// PVs
 	pc := controller.NewProvisionController(clientset,
@@ -273,6 +359,10 @@ func main() {
 		clientNFSProvisioner,
 		serverVersion.GitVersion,
 		controller.LeaderElection(leaderElection),
+		controller.Threadiness(5),
+		controller.FailedProvisionThreshold(10),
+		controller.FailedDeleteThreshold(10),
+		controller.RateLimiter(controller.DefaultControllerRateLimiter()),
 	)
 	// Never stops.
 	pc.Run(context.Background())
