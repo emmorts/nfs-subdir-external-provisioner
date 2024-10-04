@@ -152,6 +152,14 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 		return nil, controller.ProvisioningFinished, fmt.Errorf("unable to set permissions on new directory: %v", err)
 	}
 
+	mountOptions := options.StorageClass.MountOptions
+
+	if customOptions, ok := options.StorageClass.Parameters["mountOptions"]; ok {
+		mountOptions = append(mountOptions, strings.Split(customOptions, ",")...)
+	}
+
+	mountOptions = ensureMountOptions(mountOptions)
+
 	pv := &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: options.PVName,
@@ -159,7 +167,7 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: *options.StorageClass.ReclaimPolicy,
 			AccessModes:                   options.PVC.Spec.AccessModes,
-			MountOptions:                  options.StorageClass.MountOptions,
+			MountOptions:                  mountOptions,
 			Capacity: v1.ResourceList{
 				v1.ResourceName(v1.ResourceStorage): options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
 			},
@@ -173,13 +181,39 @@ func (p *nfsProvisioner) Provision(ctx context.Context, options controller.Provi
 		},
 	}
 
-	// Add custom mount options if specified in StorageClass
-	if mountOptions, ok := options.StorageClass.Parameters["mountOptions"]; ok {
-		pv.Spec.MountOptions = append(pv.Spec.MountOptions, strings.Split(mountOptions, ",")...)
-	}
-
 	provisionAttempts.WithLabelValues("success").Inc()
 	return pv, controller.ProvisioningFinished, nil
+}
+
+func ensureMountOptions(options []string) []string {
+	requiredOptions := map[string]string{
+		"nfsvers":    "4.1",
+		"rsize":      "1048576",
+		"wsize":      "1048576",
+		"hard":       "",
+		"timeo":      "600",
+		"retrans":    "2",
+		"noresvport": "",
+	}
+
+	for option, value := range requiredOptions {
+		found := false
+		for _, existingOption := range options {
+			if strings.HasPrefix(existingOption, option) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			if value != "" {
+				options = append(options, option+"="+value)
+			} else {
+				options = append(options, option)
+			}
+		}
+	}
+
+	return options
 }
 
 func (p *nfsProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume) error {
